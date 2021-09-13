@@ -1,4 +1,3 @@
-# GIND
+# user-app-runtime
 
-GIND (gvisor in Docker)
-
+Runs a users application in a secure runtime (gvisor)
