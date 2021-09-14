@@ -41,7 +41,7 @@ func main() {
 		panic(err)
 	}
 
-	ociSpec := generateOCISpec(user_data.Hostname, "/", "", []string{"/bin/echo", "HELLO", "FROM", "CONTAINER"})
+	ociSpec := generateOCISpec(user_data.Hostname, "/", "/var/run/netns/userappnet", []string{"/bin/sh"})
 
 	ociSpecfile, _ := json.MarshalIndent(ociSpec, "", "	")
 
@@ -120,6 +120,39 @@ func main() {
 	}
 
 	cli.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{})
+
+	// dodgy hack for creating resolv.conf
+	err = os.WriteFile(dst+"/etc/resolv.conf", []byte("nameserver 8.8.8.8"), 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	log.Println("Starting & attaching container")
+	// Get the current working directory.
+	cwd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+
+	// Transfer stdin, stdout, and stderr to the new process
+	// and also set target directory for the shell to start in.
+	pa := os.ProcAttr{
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		Dir:   cwd,
+	}
+
+	// Start up a new shell.
+	proc, err := os.StartProcess("/usr/local/bin/runsc", []string{"runsc", "run", "-bundle", "testing/container", "user-container"}, &pa)
+	if err != nil {
+		panic(err)
+	}
+
+	// Wait until user exits the shell
+	state, err := proc.Wait()
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("<< Exited container: %s\n", state.String())
 }
 
 func generateOCISpec(hostname string, cwd string, netns string, args []string) *specs.Spec {
