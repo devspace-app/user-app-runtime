@@ -4,11 +4,13 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"flag"
 	"io"
 	"io/fs"
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/docker/docker/api/types"
 	dockerContainer "github.com/docker/docker/api/types/container"
@@ -17,112 +19,63 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-type UserData struct {
-	Image    string
-	Hostname string
+type RuntimeData struct {
+	Image      string
+	Name       string
+	Entrypoint string
 }
 
 func main() {
-	file, _ := ioutil.ReadFile("testing/user-data.json")
+	// Load CLI args
+	userDataLocation := flag.String("user-data", "testing/runtime-data.json", "Location of the runtime-data file")
+	containerLocation := flag.String("container", "testing/container", "Location of the container directory")
+	flag.Parse()
 
-	user_data := UserData{}
-
-	_ = json.Unmarshal([]byte(file), &user_data)
-
-	log.Println("Loading container with image " + user_data.Image)
-
-	os.RemoveAll("testing/container")
-
-	container_location := "testing/container"
-	if err := os.MkdirAll(container_location, 0755); err != nil {
-		panic(err)
-	}
-	if err := os.MkdirAll(container_location+"/rootfs", 0755); err != nil {
-		panic(err)
+	// Load the runtime user-data
+	file, err := ioutil.ReadFile(*userDataLocation)
+	if err != nil {
+		log.Fatalln("Failed to open user-data file", err)
 	}
 
-	ociSpec := generateOCISpec(user_data.Hostname, "/", "/var/run/netns/userappnet", []string{"/bin/sh"})
+	runtimeData := RuntimeData{}
+
+	err = json.Unmarshal([]byte(file), &runtimeData)
+	if err != nil {
+		log.Fatalln("Failed to parse runtime-data", err)
+	}
+
+	log.Println("Loading container with image " + runtimeData.Image)
+
+	// Cleanup any previous container
+	// In an actual environment this directory would be empty, but for testing it may not
+	os.RemoveAll(*containerLocation)
+
+	// Then recreate the container directory
+	if err := os.MkdirAll(*containerLocation, 0755); err != nil {
+		panic(err)
+	}
+
+	// Create the rootfs directory
+	rootfs := filepath.Join(*containerLocation, "rootfs")
+	if err := os.MkdirAll(rootfs, 0755); err != nil {
+		panic(err)
+	}
+
+	// Generate an OCI runtime spec and place it in container directory
+	ociSpec := generateOCISpec(runtimeData.Name, "/", "/var/run/netns/userappnet", []string{runtimeData.Entrypoint})
 
 	ociSpecfile, _ := json.MarshalIndent(ociSpec, "", "	")
 
-	_ = ioutil.WriteFile("testing/container/config.json", ociSpecfile, 0644)
+	_ = ioutil.WriteFile(filepath.Join(*containerLocation, "config.json"), ociSpecfile, 0644)
 
-	// return //testinggggg
-
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	err = exportDockerImage(runtimeData.Image, rootfs)
 	if err != nil {
+		log.Println("Failed to load Docker image", runtimeData.Image)
 		panic(err)
 	}
-
-	reader, err := cli.ImagePull(ctx, user_data.Image, types.ImagePullOptions{})
-	if err != nil {
-		panic(err)
-	}
-	io.Copy(os.Stdout, reader)
-
-	container, err := cli.ContainerCreate(ctx, &dockerContainer.Config{
-		Image: user_data.Image,
-	}, nil, nil, nil, "")
-	if err != nil {
-		panic(err)
-	}
-
-	exported_container, err := cli.ContainerExport(ctx, container.ID)
-	if err != nil {
-		panic(err)
-	}
-
-	dst := "testing/container/rootfs"
-
-	tarReader := tar.NewReader(exported_container)
-
-	for true {
-		header, err := tarReader.Next()
-
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			log.Fatalf("ExtractTarGz: Next() failed: %s", err.Error())
-		}
-
-		path := dst + "/" + header.Name
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.Mkdir(path, 0755); err != nil {
-				log.Fatalf("ExtractTarGz: Mkdir() failed: %s", err.Error())
-			}
-			os.Chown(path, header.Uid, header.Gid)
-		case tar.TypeReg:
-			outFile, err := os.Create(path)
-			if err != nil {
-				log.Fatalf("ExtractTarGz: Create() failed: %s", err.Error())
-			}
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				log.Fatalf("ExtractTarGz: Copy() failed: %s", err.Error())
-			}
-			outFile.Close()
-			os.Chown(path, header.Uid, header.Gid)
-			os.Chmod(path, fs.FileMode(header.Mode))
-		case tar.TypeSymlink, tar.TypeLink:
-			os.Symlink(header.Linkname, path)
-
-		default:
-			log.Printf(
-				"ExtractTarGz: uknown type: %b in %s",
-				header.Typeflag,
-				path)
-		}
-
-	}
-
-	cli.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{})
 
 	// dodgy hack for creating resolv.conf
-	err = os.WriteFile(dst+"/etc/resolv.conf", []byte("nameserver 8.8.8.8"), 0644)
+	err = os.WriteFile(filepath.Join(rootfs, "/etc/resolv.conf"), []byte("nameserver 8.8.8.8\n"), 0644)
 	if err != nil {
 		panic(err)
 	}
@@ -142,7 +95,7 @@ func main() {
 	}
 
 	// Start up a new shell.
-	proc, err := os.StartProcess("/usr/local/bin/runsc", []string{"runsc", "run", "-bundle", "testing/container", "user-container"}, &pa)
+	proc, err := os.StartProcess("/usr/local/bin/runsc", []string{"runsc", "run", "-bundle", *containerLocation, "user-container"}, &pa)
 	if err != nil {
 		panic(err)
 	}
@@ -153,6 +106,116 @@ func main() {
 		panic(err)
 	}
 	log.Printf("<< Exited container: %s\n", state.String())
+}
+
+func exportDockerImage(image string, exportLocation string) error {
+	// Load docker container
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+
+	hasImage := false
+	hostImages, err := cli.ImageList(ctx, types.ImageListOptions{})
+	for _, hostImage := range hostImages {
+		for _, tag := range hostImage.RepoTags {
+			if tag == tag {
+				hasImage = true
+			}
+		}
+	}
+
+	if hasImage {
+		log.Println("Image exists already, skipping pull")
+	} else {
+		reader, err := cli.ImagePull(ctx, image, types.ImagePullOptions{})
+		if err != nil {
+			return err
+		}
+		io.Copy(os.Stdout, reader)
+	}
+
+	container, err := cli.ContainerCreate(ctx, &dockerContainer.Config{
+		Image: image,
+	}, nil, nil, nil, "")
+	if err != nil {
+		return err
+	}
+
+	exported_container, err := cli.ContainerExport(ctx, container.ID)
+	if err != nil {
+		return err
+	}
+
+	// Unpack the Docker image into the OCI container directory
+	tarReader := tar.NewReader(exported_container)
+
+	for true {
+		header, err := tarReader.Next()
+
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			return err
+		}
+
+		path := filepath.Join(exportLocation, header.Name)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.Mkdir(path, 0755); err != nil {
+				return err
+			}
+			os.Chown(path, header.Uid, header.Gid)
+		case tar.TypeReg:
+			outFile, err := os.Create(path)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				return err
+			}
+			outFile.Close()
+			os.Chown(path, header.Uid, header.Gid)
+			os.Chmod(path, fs.FileMode(header.Mode))
+		case tar.TypeSymlink, tar.TypeLink:
+			os.Symlink(header.Linkname, path)
+
+		default:
+			log.Printf(
+				"ExtractTarGz: uknown type: %b in %s",
+				header.Typeflag,
+				path)
+		}
+
+	}
+
+	// Delete the staging container
+	cli.ContainerRemove(ctx, container.ID, types.ContainerRemoveOptions{})
+
+	return nil
+}
+
+func containerCapabilities() []string {
+	return []string{
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE",
+		"CAP_FSETID",
+		"CAP_FOWNER",
+		"CAP_MKNOD",
+		"CAP_NET_RAW",
+		"CAP_SETGID",
+		"CAP_SETUID",
+		"CAP_SETFCAP",
+		"CAP_SETPCAP",
+		"CAP_NET_BIND_SERVICE",
+		"CAP_SYS_CHROOT",
+		"CAP_KILL",
+		"CAP_AUDIT_WRITE",
+	}
 }
 
 func generateOCISpec(hostname string, cwd string, netns string, args []string) *specs.Spec {
@@ -171,71 +234,10 @@ func generateOCISpec(hostname string, cwd string, netns string, args []string) *
 			},
 			Cwd: cwd,
 			Capabilities: &specs.LinuxCapabilities{
-				Bounding: []string{
-					"CAP_CHOWN",
-					"CAP_DAC_OVERRIDE",
-					"CAP_FSETID",
-					"CAP_FOWNER",
-					"CAP_MKNOD",
-					"CAP_NET_RAW",
-					"CAP_SETGID",
-					"CAP_SETUID",
-					"CAP_SETFCAP",
-					"CAP_SETPCAP",
-					"CAP_NET_BIND_SERVICE",
-					"CAP_SYS_CHROOT",
-					"CAP_KILL",
-					"CAP_AUDIT_WRITE",
-				},
-				Effective: []string{
-					"CAP_CHOWN",
-					"CAP_DAC_OVERRIDE",
-					"CAP_FSETID",
-					"CAP_FOWNER",
-					"CAP_MKNOD",
-					"CAP_NET_RAW",
-					"CAP_SETGID",
-					"CAP_SETUID",
-					"CAP_SETFCAP",
-					"CAP_SETPCAP",
-					"CAP_NET_BIND_SERVICE",
-					"CAP_SYS_CHROOT",
-					"CAP_KILL",
-					"CAP_AUDIT_WRITE",
-				},
-				Inheritable: []string{
-					"CAP_CHOWN",
-					"CAP_DAC_OVERRIDE",
-					"CAP_FSETID",
-					"CAP_FOWNER",
-					"CAP_MKNOD",
-					"CAP_NET_RAW",
-					"CAP_SETGID",
-					"CAP_SETUID",
-					"CAP_SETFCAP",
-					"CAP_SETPCAP",
-					"CAP_NET_BIND_SERVICE",
-					"CAP_SYS_CHROOT",
-					"CAP_KILL",
-					"CAP_AUDIT_WRITE",
-				},
-				Permitted: []string{
-					"CAP_CHOWN",
-					"CAP_DAC_OVERRIDE",
-					"CAP_FSETID",
-					"CAP_FOWNER",
-					"CAP_MKNOD",
-					"CAP_NET_RAW",
-					"CAP_SETGID",
-					"CAP_SETUID",
-					"CAP_SETFCAP",
-					"CAP_SETPCAP",
-					"CAP_NET_BIND_SERVICE",
-					"CAP_SYS_CHROOT",
-					"CAP_KILL",
-					"CAP_AUDIT_WRITE",
-				},
-				// TODO(gvisor.dev/issue/3166): support ambient capabilities
+				Bounding:    containerCapabilities(),
+				Effective:   containerCapabilities(),
+				Inheritable: containerCapabilities(),
+				Permitted:   containerCapabilities(),
 			},
 			Rlimits: []specs.POSIXRlimit{
 				{
